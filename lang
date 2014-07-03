@@ -1,0 +1,342 @@
+#!/usr/bin/python
+import sys
+import os
+from copy import copy
+
+import argparse
+
+class Cursor(object):
+  def __init__(self, fnam, line = None, char = None):
+    if char is None:
+      char = 0
+    if line is None:
+      line = 1
+    self.line = line
+    self.char = char
+    self.fnam = fnam
+    self.pos = 0
+
+  def inc(self):
+    self.char += 1
+    self.pos += 1
+
+  def nl(self):
+    self.line += 1
+    self.char = 0
+
+  def show(c):
+    sys.stderr.write("in {} at {}:{}\n".format(c.fnam, c.line, c.char))
+
+
+def failw(c, text):
+  sys.stderr.write("err in {} at {}:{} - {}\n".format(c.fnam, c.line, c.char, text))
+  exit(1)
+
+class Lng(object):
+  def __init__(self, source, name):
+    self.source = source
+    self.c = Cursor(name)
+
+  def _quo(self, q, i):
+    if q:
+      return ('quot', copy(self.c), i)
+    else:
+      return i
+
+  def parse_sexpr(self, text):
+    dquoted = False
+    quoted = False
+    item = ''
+    items = []
+    started = False
+
+    #for ti, t in enumerate(text):
+    while not self.c.pos == len(self.source):
+      t = self.source[self.c.pos]
+      self.c.inc()
+      if t == '\n':
+        self.c.nl()
+
+#      self.c.show()
+#      print t, item, items, started
+
+      if not started and t.isspace():
+        continue
+
+      if not started:
+        if not t == '(':
+          continue
+#         failw(self.c, 'expression has to start with (')
+        else:
+          started = True
+          continue
+
+      if t == '(':
+        self.c.pos -= 1
+        items.append(self._quo(quoted, self.parse_sexpr(text)))
+        quoted = False
+        continue
+
+      if t == '"':
+        if dquoted:
+          dquoted = False
+          items.append(self._quo(quoted, ('txt', copy(self.c), item)))
+          item = ''
+          quoted = False
+        else:
+          dquoted = True
+        continue
+      if t == "'":
+        quoted = True
+        continue
+
+      if t.isspace() and not dquoted:
+        if not item == '':
+          if item.isdigit():
+            typ = 'num'
+          elif item[0].isalpha() or (item[0] in '=+-/*!@$%#^&*`~[]'):
+            typ = 'name'
+          else:
+            failw(item[1], "can't determine type of '{}'".format(item))
+
+          items.append(self._quo(quoted, (typ, copy(self.c), item)))
+          quoted = False
+          item = ''
+        continue
+      if t == ')':
+        if not item == '':
+          if item.isdigit():
+            typ = 'num'
+          elif item[0].isalpha() or (item[0] in '=+-/*!@$%#^&*`~[]'):
+            typ = 'name'
+          else:
+            failw(item[1], "can't determine type of '{}'".format(item))
+
+          items.append(self._quo(quoted, (typ, copy(self.c), item)))
+          quoted = False
+          item = ''
+
+#        if not item == '':
+#          items.append(self._quo(quoted, item))
+#          quoted = False
+        return ('exp', items)
+
+      item += t
+
+    if started:
+      failw(self.c, 'expression has to end with )')
+
+  def parse(self):
+    md = len(self.source) / 400 + 1
+    t = 0
+    r = []
+    while self.c.pos != len(self.source):
+      if not self.c.pos % md:
+        sys.stderr.write("{}/{}  \r".format(self.c.pos, len(self.source)))
+      p = self.parse_sexpr('')
+      if p is not None:
+        r.append(p)
+    print
+    self.ast = r
+    return r
+
+class Scope(object):
+  def __init__(self, upper = None):
+    self.names = {}
+    # [0] - type in {'fun', 'var', ...}
+    # [1] - for fun - parameters
+    #     - other unspec.
+    # [2] - for fun - scope
+    # [3] - for fun - fun. body
+    self.upper = upper
+    # upper is upper scope
+
+  def vars(self):
+    return {i:self.names[i] for i in filter(lambda x: self.names[x][0] == 'var', self.names)}
+
+  def funs(self):
+    return {i:self.names[i] for i in filter(lambda x: self.names[x][0] == 'fun', self.names)}
+
+  def lookup_var(self, name):
+    print "lookup_var", name
+    if self.vars().has_key(name):
+      return self.vars()[name]
+    elif self.upper is not None:
+      return self.upper.lookup_var(name)
+    else:
+      return None
+
+  def lookup_fun(self, name):
+    print "lookup_fun", name
+    if self.funs().has_key(name):
+      return self.funs()[name]
+    elif self.upper is not None:
+      return self.upper.lookup_fun(name)
+    else:
+      return None
+
+class Ast(object):
+  def __init__(self, ast):
+    self.ast = ast
+
+    self.scope = Scope()
+
+  def exec_defvar(self, i, scope):
+    name = i[0][2]
+    scope.names[name] = ('var', None, 0) #type, value
+
+  def exec_defun(self, i, scope):
+    name = i[1][2]
+    c = i[0][1] # cursor
+#    print i[2][1]
+    params = map(lambda x: x[2], i[2][1])
+#    print name, c, params
+    nscope = Scope(scope)
+    scope.names[name] = ('fun', params, nscope, self.cvt([i[3]], nscope))
+
+  def convert(self):
+    self.cvt(self.ast, self.scope)
+
+  def cvt(self, ast, scope):
+    #print ast
+    self.extract_vars(ast, scope)
+    print 'scopevars', scope.vars()
+    self.extract_defuns(ast, scope)
+#    print self.scope.names
+    self.extract_code(ast, scope)
+#    for idx, (t, i) in enumerate(ast):
+#      if t == 'exp' and i[0] == 'var':
+
+  def gen_call(self, i, f, ast_params, scope):
+    fun_name = i[0][2]
+    c = i[0][1]
+    #ast_params ist ast of parameters to call
+    params = f[1]
+    if len(ast_params) != len(params):
+      failw(c, "incorrect number of arguments to {}. Is {} should be {}".format(fun_name, len(ast_params), len(params)))
+
+#    vrs = map(outscope.lookup_var, params)
+    print params, ast_params
+    # push used regs
+    # push arguments
+    print 'ld %0 [0x000040]'
+    print 'ld %1 [0x000041]'
+    print 'ld %2 [0x000042]'
+    print 'st %2 [0x000044]' # store top 8bits of SP to IND register
+
+    print ast_params
+    #ps = map(lambda x: self.cvt(x, scope), ast_params)
+    for par in ast_params:
+      if len(par) == 2:
+        typ, rst = par
+      elif len(par) == 3:
+        typ, cur, val = par
+
+      if typ == 'num':
+        print 'mov %2', hex(int(val))
+        print 'st %2 %0 %1' # store it
+        print 'mov %2 0x1'
+        print 'sub %0 %0 %2' # move SP
+      elif typ == 'name':
+        v = scope.lookup_var(val)
+        if v is None:
+          failw(cur, "can't find definition of {}".format(val))
+        # retrieve either on-stack relative address or absolute one
+        # and lets pretend we know which we need
+        a = 0x12342 # lolz
+        offset = 0x10 # we pretend we know stack offset, we'll know it ofc, we'll know all types and their size and order, and compute it
+        direct = True
+        if direct:
+          print 'ld %2 [', a, ']'
+          print 'st %2 %0 %1' # store it
+          print 'mov %2 0x1'
+          print 'sub %0 %0 %2' # move SP
+        else:
+          # locate our top of stack
+          # retrieve value
+          v = 123 # retireved ;)
+
+
+
+    print ps
+
+    print 'st %2 %0 %1' # save byte to stack
+    # move SP
+    print 'GEN_CALL'
+    print 'mov %0 (& {} 0xff)'.format(fun_name)
+    print 'st %0 [0xfffffd]'
+    print 'mov %0 (>> (& {} 0xff00) 8)'.format(fun_name)
+    print 'st %0 [0xfffffe]'
+    print 'mov %0 (>> (& {} 0xff0000) 16)'.format(fun_name)
+    print 'st %0 [0xffffff]'
+
+
+  def extract_code(self, ast, scope):
+    r = []
+#    print 'AST', ast
+    for idx, (t, i) in enumerate(ast):
+      if t == 'exp' and len(i) > 0:
+#        print "KOKOT", i, t, i[0]
+        if i[0][0] == 'name':
+          if i[0][2] in ['defparameter', 'defun']:
+            continue
+
+          fun_name = i[0][2]
+#          print scope.names
+          f = scope.lookup_fun(fun_name)
+          print 'gencall for', fun_name, f
+          self.gen_call(i, f, i[1:], scope) # generate code to call function
+          if f is None:
+#            print "cant find declaration of {}".format(fun_name)
+            failw(i[0][1], "cant find declaration of {}".format(fun_name))
+          else:
+            print "found definition of {}".format(fun_name)
+
+
+  def extract_vars(self, ast, scope):
+#    print ast
+    for idx, (t, i) in enumerate(ast):
+#      print 'VARS', t, i
+      if t == 'exp' and len(i) > 0:
+        if not i[0][0] == 'name':
+          continue
+#        print 'COZE'
+        if i[0][2] == 'defparameter':
+#          print 'got defparameter!!1'
+          self.exec_defvar(i, scope)
+#          print scope.names
+
+  def extract_defuns(self, ast, scope):
+#    print ast
+    for idx, (t, i) in enumerate(ast):
+#      print 'FUNS', t, i
+      if t == 'exp' and len(i) > 0:
+        if not i[0][0] == 'name':
+          continue
+        if i[0][2] == 'defun':
+#          print 'got defun!!1'
+          self.exec_defun(i, scope)
+#          print scope.names
+
+
+def main():
+  aparser = argparse.ArgumentParser(description='LISPlike C compiler.')
+  aparser.add_argument('-o', action='store', dest='output', metavar='FILE',
+                       help='direct output to FILE')
+  # Allow any number of additional arguments.
+  aparser.add_argument(nargs='+', action='store', dest='inputs', metavar='INPUT',
+                      help='input filenames')
+  args = aparser.parse_args()
+
+  for inp in args.inputs:
+    with open(inp) as fin:
+      l = Lng(fin.read(), inp)
+      r = l.parse()
+
+      Ast(l.ast).convert()
+
+      with open(inp+'.out', 'w') as fout:
+        fout.write(str(r))
+
+if __name__=="__main__":
+  main()
